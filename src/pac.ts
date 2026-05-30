@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { build } from 'esbuild';
 
 // ---------------------------------------------------------------------------
 // PAC CLI
@@ -81,25 +80,6 @@ export function runNpmScript(script: string, cwd: string, log: (msg: string) => 
             }
         });
         proc.on('close', (code) => resolve(code ?? 0));
-    });
-}
-
-// ---------------------------------------------------------------------------
-// esbuild
-// ---------------------------------------------------------------------------
-
-export async function buildFiles(entryPoints: string[], srcDir: string, distDir: string): Promise<void> {
-    await build({
-        entryPoints,
-        bundle: true,
-        format: 'iife',
-        legalComments: 'none',
-        minify: false,
-        outbase: srcDir,
-        outdir: distDir,
-        platform: 'browser',
-        sourcemap: true,
-        target: ['es2022'],
     });
 }
 

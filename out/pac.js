@@ -3,14 +3,12 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.runPac = runPac;
 exports.runDotnet = runDotnet;
 exports.runNpmScript = runNpmScript;
-exports.buildFiles = buildFiles;
 exports.collectTsFiles = collectTsFiles;
 exports.collectJsFiles = collectJsFiles;
 exports.collectStaticFiles = collectStaticFiles;
 const fs = require("fs");
 const path = require("path");
 const child_process_1 = require("child_process");
-const esbuild_1 = require("esbuild");
 // ---------------------------------------------------------------------------
 // PAC CLI
 // ---------------------------------------------------------------------------
@@ -90,23 +88,6 @@ function runNpmScript(script, cwd, log) {
             }
         });
         proc.on('close', (code) => resolve(code ?? 0));
-    });
-}
-// ---------------------------------------------------------------------------
-// esbuild
-// ---------------------------------------------------------------------------
-async function buildFiles(entryPoints, srcDir, distDir) {
-    await (0, esbuild_1.build)({
-        entryPoints,
-        bundle: true,
-        format: 'iife',
-        legalComments: 'none',
-        minify: false,
-        outbase: srcDir,
-        outdir: distDir,
-        platform: 'browser',
-        sourcemap: true,
-        target: ['es2022'],
     });
 }
 // ---------------------------------------------------------------------------

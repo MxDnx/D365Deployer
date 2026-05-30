@@ -3,15 +3,19 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.checkSettingsReady = void 0;
 exports.deployFile = deployFile;
 exports.deployAll = deployAll;
+exports.findPluginProjects = findPluginProjects;
 exports.deployPackageToCrm = deployPackageToCrm;
 exports.runDiagnose = runDiagnose;
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
+const child_process_1 = require("child_process");
 const settings_1 = require("./settings");
 Object.defineProperty(exports, "checkSettingsReady", { enumerable: true, get: function () { return settings_1.checkSettingsReady; } });
 const solution_xml_1 = require("./solution-xml");
 const pac_1 = require("./pac");
+const pluginConfig_1 = require("./pluginConfig");
 // ---------------------------------------------------------------------------
 // Deploy a single file
 // ---------------------------------------------------------------------------
@@ -65,7 +69,7 @@ async function deployFile(sourceFile, workspaceRoot, log) {
 // ---------------------------------------------------------------------------
 // Deploy all TypeScript files in src/
 // ---------------------------------------------------------------------------
-async function deployAll(srcFolder, workspaceRoot, log) {
+async function deployAll(_srcFolder, workspaceRoot, log) {
     const settings = (0, settings_1.loadSettings)(workspaceRoot, log);
     if (settings.preDeploymentLocalScript) {
         log(`Pre-deploy: npm run ${settings.preDeploymentLocalScript}`);
@@ -118,29 +122,304 @@ async function deployAll(srcFolder, workspaceRoot, log) {
     // 4. Register web resources, pack, import
     await packAndImport(stagingDir, wrNames, settings.solutionUniqueName, workspaceRoot, log);
 }
+function findPluginProjects(rootPath) {
+    const configPath = (0, pluginConfig_1.findPluginConfigPath)(rootPath);
+    const config = configPath ? (0, pluginConfig_1.loadPluginConfig)(configPath) : null;
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const results = [];
+    function scan(dir) {
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        }
+        catch {
+            return;
+        }
+        for (const entry of entries) {
+            if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'bin' || entry.name === 'obj') {
+                continue;
+            }
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                scan(fullPath);
+            }
+            else if (entry.isFile() && entry.name.endsWith('.csproj')) {
+                const projectName = path.basename(path.dirname(fullPath));
+                const pluginId = config ? ((0, pluginConfig_1.getPackageId)(config, projectName) ?? '') : '';
+                if (pluginId && GUID_RE.test(pluginId)) {
+                    const relDir = path.relative(rootPath, path.dirname(fullPath)) || projectName;
+                    results.push({ label: relDir, description: pluginId, csprojPath: fullPath, pluginId });
+                }
+            }
+        }
+    }
+    scan(rootPath);
+    return results;
+}
 // ---------------------------------------------------------------------------
 // Deploy Package to CRM via pac plugin push
 // ---------------------------------------------------------------------------
 async function deployPackageToCrm(csprojPath, log) {
-    const content = fs.readFileSync(csprojPath, 'utf8');
-    const match = content.match(/<PackagePluginId>\s*(.*?)\s*<\/PackagePluginId>/);
-    if (!match || !match[1].trim()) {
-        throw new Error(`PackagePluginId not found in ${path.basename(csprojPath)}.\n` +
-            `Add the following inside a <PropertyGroup>:\n` +
-            `  <PackagePluginId>your-plugin-id</PackagePluginId>`);
+    const projectName = path.basename(path.dirname(csprojPath));
+    const configPath = (0, pluginConfig_1.findPluginConfigPath)(csprojPath);
+    if (!configPath) {
+        throw new Error(`${pluginConfig_1.PLUGIN_CONFIG_FILENAME} not found. Create it at your solution root with "prefix" and "plugins".`);
     }
-    const pluginId = match[1].trim();
+    const config = (0, pluginConfig_1.loadPluginConfig)(configPath);
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const pluginId = (0, pluginConfig_1.getPackageId)(config, projectName) ?? '';
+    if (!pluginId || !GUID_RE.test(pluginId)) {
+        await createNewPluginPackage(csprojPath, configPath, config, log);
+        return;
+    }
     const cwd = path.dirname(csprojPath);
-    log(`dotnet build "${path.basename(csprojPath)}"`);
-    const buildCode = await (0, pac_1.runDotnet)(['build', csprojPath], cwd, log);
+    log(`dotnet msbuild -t:Rebuild "${path.basename(csprojPath)}"`);
+    const buildCode = await (0, pac_1.runDotnet)(['msbuild', `-t:Rebuild`, csprojPath], cwd, log);
     if (buildCode !== 0) {
         throw new Error(`dotnet build failed (exit ${buildCode})`);
     }
     log(`pac plugin push --pluginId ${pluginId}`);
     const exitCode = await (0, pac_1.runPac)(['plugin', 'push', '--pluginId', pluginId], cwd, log);
     if (exitCode !== 0) {
-        throw new Error(`pac plugin push failed (exit ${exitCode})`);
+        const choice = await vscode.window.showWarningMessage(`Plugin push failed — the package ID "${pluginId}" may not exist in Dataverse. Create a new plugin package?`, { modal: true }, 'Create New Package');
+        if (choice !== 'Create New Package') {
+            throw new Error(`pac plugin push failed (exit ${exitCode})`);
+        }
+        await createNewPluginPackage(csprojPath, configPath, config, log);
+        return;
     }
+    log('Refreshing plugin list...');
+    try {
+        const orgUrl = await getPacOrgUrl();
+        const scope = `${orgUrl.replace(/\/$/, '')}/.default`;
+        const session = await vscode.authentication.getSession('microsoft', [scope], { createIfNone: false });
+        if (session && config.packages[projectName]) {
+            const plugins = await fetchPluginAssemblies(orgUrl, session.accessToken, pluginId);
+            config.packages[projectName].plugins = plugins;
+            (0, pluginConfig_1.savePluginConfig)(configPath, config);
+            log(`  ${plugins.length} plugin(s) updated in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}`);
+        }
+    }
+    catch (err) {
+        log(`  Could not refresh plugin list: ${err instanceof Error ? err.message : String(err)}`);
+    }
+}
+async function createNewPluginPackage(csprojPath, configPath, config, log) {
+    const projectName = path.basename(path.dirname(csprojPath));
+    const prefix = config.prefix?.trim();
+    if (!prefix) {
+        throw new Error(`"prefix" not set in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}.`);
+    }
+    const packageName = `${prefix}_${projectName}`;
+    const cwd = path.dirname(csprojPath);
+    log(`dotnet msbuild -t:Rebuild "${path.basename(csprojPath)}"`);
+    const buildCode = await (0, pac_1.runDotnet)(['msbuild', '-t:Rebuild', csprojPath], cwd, log);
+    if (buildCode !== 0) {
+        throw new Error(`dotnet build failed (exit ${buildCode})`);
+    }
+    const nupkgPath = findNupkg(cwd);
+    if (!nupkgPath) {
+        throw new Error('No .nupkg file found after build. Ensure your project produces a NuGet package.');
+    }
+    log(`Found package: ${path.basename(nupkgPath)}`);
+    const orgUrl = await getPacOrgUrl();
+    log(`Target environment: ${orgUrl}`);
+    log('Authenticating with Dataverse...');
+    const scope = `${orgUrl.replace(/\/$/, '')}/.default`;
+    const session = await vscode.authentication.getSession('microsoft', [scope], { createIfNone: true });
+    if (!session) {
+        throw new Error('Authentication failed or was cancelled.');
+    }
+    const nupkgFilename = path.basename(nupkgPath);
+    const versionFromFilename = nupkgFilename.match(/\.(\d+\.\d+(?:\.\d+)*)\.nupkg$/)?.[1] ?? '1.0.0.0';
+    log(`Creating plugin package "${packageName}" v${versionFromFilename} in Dataverse...`);
+    const packageContent = fs.readFileSync(nupkgPath).toString('base64');
+    const packageId = await createPluginPackageRest(orgUrl, session.accessToken, packageName, versionFromFilename, packageContent);
+    log(`  Package ID: ${packageId}`);
+    (0, pluginConfig_1.setPackageEntry)(configPath, config, projectName, packageName, packageId);
+    log('Fetching registered plugin assemblies...');
+    const plugins = await fetchPluginAssemblies(orgUrl, session.accessToken, packageId);
+    if (plugins.length > 0 && config.packages[projectName]) {
+        config.packages[projectName].plugins = plugins;
+        (0, pluginConfig_1.savePluginConfig)(configPath, config);
+        for (const p of plugins) {
+            log(`  Plugin: ${p.name} (${p.pluginId})`);
+        }
+    }
+    log(`\nPlugin created successfully.`);
+    log(`  ${projectName} → ${packageId} saved to ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}`);
+    log('\nDeployment complete.');
+}
+function findNupkg(cwd) {
+    const dirs = [
+        path.join(cwd, 'bin', 'Debug'),
+        path.join(cwd, 'bin', 'Release'),
+        path.join(cwd, 'bin'),
+    ];
+    for (const dir of dirs) {
+        if (!fs.existsSync(dir)) {
+            continue;
+        }
+        const pkgs = fs.readdirSync(dir)
+            .filter(f => f.endsWith('.nupkg'))
+            .map(f => path.join(dir, f))
+            .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+        if (pkgs.length > 0) {
+            return pkgs[0];
+        }
+    }
+    return null;
+}
+async function fetchPluginAssemblies(orgUrl, token, packageId) {
+    const stepsExpand = 'plugintype_sdkmessageprocessingstep($select=sdkmessageprocessingstepid,name,mode,stage,rank,filteringattributes)';
+    const typesExpand = `pluginassembly_plugintype($select=plugintypeid;$expand=${stepsExpand})`;
+    const filter = encodeURIComponent(`_packageid_value eq '${packageId}'`);
+    const query = `$filter=${filter}&$select=name,pluginassemblyid&$expand=${encodeURIComponent(typesExpand)}`;
+    const assembliesData = await dataverseGet(orgUrl, token, `api/data/v9.2/pluginassemblies?${query}`);
+    const entries = (assembliesData.value ?? []).map((a) => {
+        const rawSteps = (a.pluginassembly_plugintype ?? [])
+            .flatMap(t => t.plugintype_sdkmessageprocessingstep ?? []);
+        const steps = rawSteps.map(s => ({
+            stepId: s.sdkmessageprocessingstepid,
+            name: s.name,
+            mode: s.mode,
+            stage: s.stage,
+            rank: s.rank,
+            filteringAttributes: s.filteringattributes ?? '',
+            preImages: [],
+            postImages: [],
+        }));
+        return { name: a.name, pluginId: a.pluginassemblyid, steps };
+    });
+    const allStepIds = entries.flatMap(e => (e.steps ?? []).map(s => s.stepId));
+    if (allStepIds.length > 0) {
+        const imageFilter = allStepIds
+            .map(id => `_sdkmessageprocessingstepid_value eq '${id}'`)
+            .join(' or ');
+        const imageQuery = `$filter=${encodeURIComponent(imageFilter)}&$select=sdkmessageprocessingstepimageid,name,attributes,imagetype,_sdkmessageprocessingstepid_value`;
+        const imagesData = await dataverseGet(orgUrl, token, `api/data/v9.2/sdkmessageprocessingstepimages?${imageQuery}`);
+        const stepMap = new Map();
+        for (const e of entries) {
+            for (const s of e.steps ?? []) {
+                stepMap.set(s.stepId, s);
+            }
+        }
+        for (const i of (imagesData.value ?? [])) {
+            const step = stepMap.get(i._sdkmessageprocessingstepid_value);
+            if (!step) {
+                continue;
+            }
+            const image = { imageId: i.sdkmessageprocessingstepimageid, name: i.name, attributes: i.attributes ?? '' };
+            if (i.imagetype === 0 || i.imagetype === 2) {
+                step.preImages.push(image);
+            }
+            if (i.imagetype === 1 || i.imagetype === 2) {
+                step.postImages.push(image);
+            }
+        }
+    }
+    return entries;
+}
+function dataverseGet(orgUrl, token, relativeUrl) {
+    const apiUrl = new URL(relativeUrl, orgUrl);
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: apiUrl.hostname,
+            path: apiUrl.pathname + apiUrl.search,
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'OData-MaxVersion': '4.0',
+                'OData-Version': '4.0',
+                'Accept': 'application/json',
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk.toString(); });
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    try {
+                        resolve(JSON.parse(data));
+                    }
+                    catch {
+                        resolve({});
+                    }
+                }
+                else {
+                    reject(new Error(`Failed to fetch plugin assemblies: ${res.statusCode} ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+function getPacOrgUrl() {
+    return new Promise((resolve, reject) => {
+        const isWindows = process.platform === 'win32';
+        const [cmd, args] = isWindows
+            ? ['cmd.exe', ['/c', 'pac', 'org', 'who']]
+            : ['pac', ['org', 'who']];
+        let output = '';
+        const proc = (0, child_process_1.spawn)(cmd, args, { shell: false });
+        proc.stdout.on('data', (d) => { output += d.toString(); });
+        proc.stderr.on('data', (d) => { output += d.toString(); });
+        proc.on('close', (code) => {
+            if (code !== 0) {
+                reject(new Error('pac org who failed — ensure you are authenticated with PAC CLI.'));
+                return;
+            }
+            const m = output.match(/Org URL:\s*(https:\/\/[^\s]+)/i);
+            if (!m) {
+                reject(new Error('Could not parse Org URL from pac org who output.'));
+                return;
+            }
+            resolve(m[1].trim());
+        });
+    });
+}
+function createPluginPackageRest(orgUrl, token, name, version, content) {
+    const apiUrl = new URL('api/data/v9.2/pluginpackages', orgUrl);
+    const body = JSON.stringify({ name, version, content });
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: apiUrl.hostname,
+            path: apiUrl.pathname,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'OData-MaxVersion': '4.0',
+                'OData-Version': '4.0',
+                'Accept': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk.toString(); });
+            res.on('end', () => {
+                if (res.statusCode === 201 || res.statusCode === 204) {
+                    const entityId = res.headers['odata-entityid'];
+                    if (!entityId) {
+                        reject(new Error('Plugin package created but ID not returned by API.'));
+                        return;
+                    }
+                    const m = entityId.match(/\(([0-9a-f-]{36})\)/i);
+                    if (!m) {
+                        reject(new Error(`Cannot parse plugin ID from: ${entityId}`));
+                        return;
+                    }
+                    resolve(m[1]);
+                }
+                else {
+                    reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
 }
 // ---------------------------------------------------------------------------
 // Run diagnostics in the output panel

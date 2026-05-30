@@ -2,8 +2,8 @@
   "name": "d365-deployer",
   "displayName": "D365 Deployer",
   "description": "Deploy web resources and packages to Dynamics 365 CE directly from the VS Code explorer context menu.",
-  "version": "0.9.0",
-  "publisher": "maxim",
+  "version": "1.0.3",
+  "publisher": "MxDnx",
   "icon": "images/logo.png",
   "engines": {
     "vscode": "^1.85.0"
@@ -81,11 +81,10 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package --allow-missing-repository",
+    "ship": "npm run compile && npm run package && node scripts/install-vsix.js"
   },
-  "dependencies": {
-    "esbuild": "^0.25.1"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",

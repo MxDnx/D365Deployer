@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Read(//c/Users/maxim/**)",
+      "PowerShell(echo '{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"vsce package\"}}' | powershell -NoProfile -File \"c:\\\\Users\\\\maxim\\\\AppData\\\\Local\\\\Temp\\\\test-hook.ps1\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\maxim\\\\repos\\\\D365Deployer\\\\src\" -Recurse -Force)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(npm run *)",
+      "Bash(npm ls *)",
+      "Bash(npm prune *)",
+      "PowerShell(echo '{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"npm run package\"}}' | powershell -NoProfile -File \"c:\\\\Users\\\\maxim\\\\AppData\\\\Local\\\\Temp\\\\test-hook2.ps1\")",
+      "Bash(code --version)",
+      "Bash(where.exe code *)",
+      "Bash(Get-Command code *)",
+      "Bash(Select-Object -ExpandProperty Source)",
+      "Bash(node -e \"const {name,version}=require\\('./package.json'\\);require\\('child_process'\\).execSync\\('\\\\\"C:\\\\\\\\Users\\\\\\\\maxim\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Programs\\\\\\\\Microsoft VS Code\\\\\\\\bin\\\\\\\\code.cmd\\\\\" --install-extension '+name+'-'+version+'.vsix --force',{stdio:'inherit'}\\)\")",
+      "Bash(node scripts/install-vsix.js)",
+      "PowerShell(pac auth --help 2>&1)",
+      "PowerShell(pac org who --help 2>&1)",
+      "PowerShell(pac org who 2>&1)",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.pac\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName; Get-ChildItem \"$env:APPDATA\\\\pac\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\maxim\\\\AppData\\\\Local\\\\Microsoft\\\\PowerAppsCLI\\\\\" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match \"auth|token|cache|profile\" } | Select-Object FullName)",
+      "Bash(npx tsc *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\maxim\\AppData\\Local\\Temp"
+    ]
+  }
+}

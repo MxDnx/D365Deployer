@@ -1,5 +1,6 @@
 ﻿import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { deployFile, deployAll, runDiagnose, checkSettingsReady, deployPackageToCrm } from './commands';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -56,34 +57,43 @@ export function activate(context: vscode.ExtensionContext) {
 
         vscode.commands.registerCommand('d365WebResourceDeployer.diagnose', () => runDiagnose(output)),
 
-        vscode.commands.registerCommand('d365WebResourceDeployer.deployPackageToCrm', async (uri: vscode.Uri) => {
-            if (!uri) { vscode.window.showErrorMessage('No folder selected.'); return; }
+        vscode.commands.registerCommand('d365WebResourceDeployer.deployPackageToCrm', async (uri: vscode.Uri, uris?: vscode.Uri[]) => {
+            const targets = uris && uris.length > 0 ? uris : (uri ? [uri] : []);
+            if (targets.length === 0) { vscode.window.showErrorMessage('No folder selected.'); return; }
 
-            const fs = await import('fs');
-            const csprojFiles = fs.readdirSync(uri.fsPath).filter((f: string) => f.endsWith('.csproj'));
-            if (csprojFiles.length === 0) {
-                vscode.window.showErrorMessage(`No .csproj file found in ${uri.fsPath}`);
-                return;
+            const csprojPaths: string[] = [];
+            for (const target of targets) {
+                const files = fs.readdirSync(target.fsPath).filter((f: string) => f.endsWith('.csproj'));
+                if (files.length === 0) {
+                    vscode.window.showErrorMessage(`No .csproj found in ${path.basename(target.fsPath)}`);
+                    return;
+                }
+                if (files.length > 1) {
+                    vscode.window.showErrorMessage(`Multiple .csproj found in ${path.basename(target.fsPath)}`);
+                    return;
+                }
+                csprojPaths.push(path.join(target.fsPath, files[0]));
             }
-            if (csprojFiles.length > 1) {
-                vscode.window.showErrorMessage(`Multiple .csproj files found in ${uri.fsPath}. Only one is supported.`);
-                return;
-            }
-            const path = await import('path');
-            const csprojPath = path.join(uri.fsPath, csprojFiles[0]);
 
             output.show(true);
             output.appendLine('');
-            const statusBar = showStatusBar('D365: Deploy Package');
+            const statusBar = showStatusBar('D365: Deploy Plugin(s)');
             try {
-                await deployPackageToCrm(csprojPath, log);
+                for (const csprojPath of csprojPaths) {
+                    log(`\n--- Deploying ${path.basename(path.dirname(csprojPath))} ---`);
+                    await deployPackageToCrm(csprojPath, log);
+                }
                 statusBar.dispose();
-                vscode.window.showInformationMessage('Package deployment to CRM completed.');
+                vscode.window.showInformationMessage(
+                    csprojPaths.length === 1
+                        ? `Plugin deployment completed: ${path.basename(path.dirname(csprojPaths[0]))}`
+                        : `${csprojPaths.length} plugin(s) deployed successfully.`
+                );
             } catch (err: unknown) {
                 statusBar.dispose();
                 const msg = err instanceof Error ? err.message : String(err);
                 log(`\nError: ${msg}`);
-                vscode.window.showErrorMessage(`Package deployment failed: ${msg}`);
+                vscode.window.showErrorMessage(`Plugin deployment failed: ${msg}`);
             }
         }),
     );
