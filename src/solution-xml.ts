@@ -34,6 +34,19 @@ export const RELATIONSHIPS_TEMPLATE = `<?xml version="1.0" encoding="utf-8"?>
 // ---------------------------------------------------------------------------
 
 export function generateSolutionXml(settings: Settings): string {
+    return generateSolutionXmlWithRootComponents(settings, '    <RootComponents />');
+}
+
+export function generateSolutionXmlWithPluginPackage(settings: Settings, packageName: string): string {
+    const rootComponents = [
+        '    <RootComponents>',
+        `      <RootComponent type="10029" schemaName="${packageName}" behavior="0" />`,
+        '    </RootComponents>',
+    ].join('\n');
+    return generateSolutionXmlWithRootComponents(settings, rootComponents);
+}
+
+function generateSolutionXmlWithRootComponents(settings: Settings, rootComponentsXml: string): string {
     const pub = `${settings.publisherPrefix}publisher`;
     return `<?xml version="1.0" encoding="utf-8"?>
 <ImportExportXml version="9.1.0.643" SolutionPackageVersion="9.1" languagecode="1033" generatedBy="CrmLive" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -86,7 +99,7 @@ export function generateSolutionXml(settings: Settings): string {
         </Address>
       </Addresses>
     </Publisher>
-    <RootComponents />
+${rootComponentsXml}
     <MissingDependencies />
   </SolutionManifest>
 </ImportExportXml>`;

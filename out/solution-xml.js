@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RELATIONSHIPS_TEMPLATE = exports.CUSTOMIZATIONS_TEMPLATE = void 0;
 exports.generateSolutionXml = generateSolutionXml;
+exports.generateSolutionXmlWithPluginPackage = generateSolutionXmlWithPluginPackage;
 exports.syncSolutionWebResources = syncSolutionWebResources;
 const fs = require("fs");
 const path = require("path");
@@ -33,6 +34,17 @@ exports.RELATIONSHIPS_TEMPLATE = `<?xml version="1.0" encoding="utf-8"?>
 // Solution.xml
 // ---------------------------------------------------------------------------
 function generateSolutionXml(settings) {
+    return generateSolutionXmlWithRootComponents(settings, '    <RootComponents />');
+}
+function generateSolutionXmlWithPluginPackage(settings, packageName) {
+    const rootComponents = [
+        '    <RootComponents>',
+        `      <RootComponent type="10029" schemaName="${packageName}" behavior="0" />`,
+        '    </RootComponents>',
+    ].join('\n');
+    return generateSolutionXmlWithRootComponents(settings, rootComponents);
+}
+function generateSolutionXmlWithRootComponents(settings, rootComponentsXml) {
     const pub = `${settings.publisherPrefix}publisher`;
     return `<?xml version="1.0" encoding="utf-8"?>
 <ImportExportXml version="9.1.0.643" SolutionPackageVersion="9.1" languagecode="1033" generatedBy="CrmLive" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -85,7 +97,7 @@ function generateSolutionXml(settings) {
         </Address>
       </Addresses>
     </Publisher>
-    <RootComponents />
+${rootComponentsXml}
     <MissingDependencies />
   </SolutionManifest>
 </ImportExportXml>`;

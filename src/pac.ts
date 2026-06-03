@@ -29,6 +29,34 @@ export function runPac(args: string[], cwd: string, log: (msg: string) => void):
     });
 }
 
+export function runPacCapture(args: string[], cwd: string, log: (msg: string) => void): Promise<{ code: number; output: string }> {
+    return new Promise((resolve) => {
+        const isWindows = process.platform === 'win32';
+        const [cmd, cmdArgs]: [string, string[]] = isWindows
+            ? ['cmd.exe', ['/c', 'pac', ...args]]
+            : ['pac', args];
+
+        let output = '';
+        const proc = spawn(cmd, cmdArgs, { cwd, shell: false });
+
+        proc.stdout.on('data', (data: Buffer) => {
+            const text = data.toString();
+            output += text;
+            for (const line of text.split(/\r?\n/)) {
+                if (line) { log(line); }
+            }
+        });
+        proc.stderr.on('data', (data: Buffer) => {
+            const text = data.toString();
+            output += text;
+            for (const line of text.split(/\r?\n/)) {
+                if (line) { log(line); }
+            }
+        });
+        proc.on('close', (code) => resolve({ code: code ?? 0, output }));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // dotnet CLI runner
 // ---------------------------------------------------------------------------

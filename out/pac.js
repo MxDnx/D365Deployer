@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.runPac = runPac;
+exports.runPacCapture = runPacCapture;
 exports.runDotnet = runDotnet;
 exports.runNpmScript = runNpmScript;
 exports.collectTsFiles = collectTsFiles;
@@ -34,6 +35,35 @@ function runPac(args, cwd, log) {
             }
         });
         proc.on('close', (code) => resolve(code ?? 0));
+    });
+}
+function runPacCapture(args, cwd, log) {
+    return new Promise((resolve) => {
+        const isWindows = process.platform === 'win32';
+        const [cmd, cmdArgs] = isWindows
+            ? ['cmd.exe', ['/c', 'pac', ...args]]
+            : ['pac', args];
+        let output = '';
+        const proc = (0, child_process_1.spawn)(cmd, cmdArgs, { cwd, shell: false });
+        proc.stdout.on('data', (data) => {
+            const text = data.toString();
+            output += text;
+            for (const line of text.split(/\r?\n/)) {
+                if (line) {
+                    log(line);
+                }
+            }
+        });
+        proc.stderr.on('data', (data) => {
+            const text = data.toString();
+            output += text;
+            for (const line of text.split(/\r?\n/)) {
+                if (line) {
+                    log(line);
+                }
+            }
+        });
+        proc.on('close', (code) => resolve({ code: code ?? 0, output }));
     });
 }
 // ---------------------------------------------------------------------------

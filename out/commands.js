@@ -13,7 +13,6 @@ const https = require("https");
 const child_process_1 = require("child_process");
 const settings_1 = require("./settings");
 Object.defineProperty(exports, "checkSettingsReady", { enumerable: true, get: function () { return settings_1.checkSettingsReady; } });
-const solution_xml_1 = require("./solution-xml");
 const pac_1 = require("./pac");
 const pluginConfig_1 = require("./pluginConfig");
 // ---------------------------------------------------------------------------
@@ -30,16 +29,14 @@ async function deployFile(sourceFile, workspaceRoot, log) {
     }
     const srcDir = path.join(workspaceRoot, 'src');
     const distDir = path.join(workspaceRoot, 'dist');
-    const relSourceFile = path.relative(workspaceRoot, sourceFile);
     const relToSrc = path.relative(srcDir, sourceFile);
     const isTypeScript = sourceFile.endsWith('.ts') && !sourceFile.endsWith('.d.ts');
-    // 1. Resolve output path (no build — reads from dist)
     let relOutput;
     if (isTypeScript) {
         relOutput = relToSrc.replace(/\.ts$/, '.js');
     }
     else {
-        log(`Copy: ${relSourceFile}`);
+        log(`Copy: ${path.relative(workspaceRoot, sourceFile)}`);
         relOutput = relToSrc;
         const destPath = path.join(distDir, relOutput);
         fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -49,22 +46,15 @@ async function deployFile(sourceFile, workspaceRoot, log) {
     if (!fs.existsSync(builtFile)) {
         throw new Error(`File not found in dist: ${relOutput}\nRun a build first.`);
     }
-    const builtMap = isTypeScript ? builtFile + '.map' : null;
-    // 2. Prepare staging folder
-    const stagingDir = prepareStagingDir(workspaceRoot, settings);
-    // 3. Copy built file(s) into staging
     const prefix = `${settings.publisherPrefix}_`;
     const wrName = prefix + '/' + relOutput.replace(/\\/g, '/');
-    const wrNames = [wrName];
-    const stagingFilePath = path.join(stagingDir, 'WebResources', wrName);
-    fs.mkdirSync(path.dirname(stagingFilePath), { recursive: true });
-    fs.copyFileSync(builtFile, stagingFilePath);
+    const files = [{ filePath: builtFile, wrName }];
+    const builtMap = isTypeScript ? builtFile + '.map' : null;
     if (builtMap && fs.existsSync(builtMap)) {
-        fs.copyFileSync(builtMap, stagingFilePath + '.map');
-        wrNames.push(wrName + '.map');
+        files.push({ filePath: builtMap, wrName: wrName + '.map' });
     }
-    // 4. Register web resources, pack, import
-    await packAndImport(stagingDir, wrNames, settings.solutionUniqueName, workspaceRoot, log);
+    const { orgUrl, token } = await getOrgAuth(log);
+    await deployWebResourcesRest(files, settings.solutionUniqueName, orgUrl, token, log);
 }
 // ---------------------------------------------------------------------------
 // Deploy all TypeScript files in src/
@@ -87,40 +77,27 @@ async function deployAll(_srcFolder, workspaceRoot, log) {
         throw new Error('No .js files found in dist/. Run a build first.');
     }
     log(`Found ${jsFiles.length} pre-built file(s) in dist/`);
-    // 1. Prepare staging folder (no build step)
-    const stagingDir = prepareStagingDir(workspaceRoot, settings);
-    // 2. Copy all built files into staging
     const prefix = `${settings.publisherPrefix}_`;
-    const wrNames = [];
+    const files = [];
     for (const jsFile of jsFiles) {
         const relJs = path.relative(distDir, jsFile);
-        const builtMap = jsFile + '.map';
         const jsWrName = prefix + '/' + relJs.replace(/\\/g, '/');
-        const stagingJsPath = path.join(stagingDir, 'WebResources', jsWrName);
-        fs.mkdirSync(path.dirname(stagingJsPath), { recursive: true });
-        fs.copyFileSync(jsFile, stagingJsPath);
-        wrNames.push(jsWrName);
+        files.push({ filePath: jsFile, wrName: jsWrName });
+        const builtMap = jsFile + '.map';
         if (fs.existsSync(builtMap)) {
-            fs.copyFileSync(builtMap, stagingJsPath + '.map');
-            wrNames.push(jsWrName + '.map');
+            files.push({ filePath: builtMap, wrName: jsWrName + '.map' });
         }
     }
-    // 3. Copy static files from dist/static/
-    const staticDir = path.join(distDir, 'static');
-    const staticFiles = (0, pac_1.collectStaticFiles)(staticDir);
+    const staticFiles = (0, pac_1.collectStaticFiles)(path.join(distDir, 'static'));
     if (staticFiles.length > 0) {
         log(`Found ${staticFiles.length} static file(s) in dist/static/`);
         for (const staticFile of staticFiles) {
             const relStatic = path.relative(distDir, staticFile);
-            const staticWrName = prefix + '/' + relStatic.replace(/\\/g, '/');
-            const stagingStaticPath = path.join(stagingDir, 'WebResources', staticWrName);
-            fs.mkdirSync(path.dirname(stagingStaticPath), { recursive: true });
-            fs.copyFileSync(staticFile, stagingStaticPath);
-            wrNames.push(staticWrName);
+            files.push({ filePath: staticFile, wrName: prefix + '/' + relStatic.replace(/\\/g, '/') });
         }
     }
-    // 4. Register web resources, pack, import
-    await packAndImport(stagingDir, wrNames, settings.solutionUniqueName, workspaceRoot, log);
+    const { orgUrl, token } = await getOrgAuth(log);
+    await deployWebResourcesRest(files, settings.solutionUniqueName, orgUrl, token, log);
 }
 function findPluginProjects(rootPath) {
     const configPath = (0, pluginConfig_1.findPluginConfigPath)(rootPath);
@@ -167,8 +144,8 @@ async function deployPackageToCrm(csprojPath, log) {
     }
     const config = (0, pluginConfig_1.loadPluginConfig)(configPath);
     const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const pluginId = (0, pluginConfig_1.getPackageId)(config, projectName) ?? '';
-    if (!pluginId || !GUID_RE.test(pluginId)) {
+    const packageId = (0, pluginConfig_1.getPackageId)(config, projectName) ?? '';
+    if (!packageId || !GUID_RE.test(packageId)) {
         await createNewPluginPackage(csprojPath, configPath, config, log);
         return;
     }
@@ -178,23 +155,38 @@ async function deployPackageToCrm(csprojPath, log) {
     if (buildCode !== 0) {
         throw new Error(`dotnet build failed (exit ${buildCode})`);
     }
-    log(`pac plugin push --pluginId ${pluginId}`);
-    const exitCode = await (0, pac_1.runPac)(['plugin', 'push', '--pluginId', pluginId], cwd, log);
-    if (exitCode !== 0) {
-        const choice = await vscode.window.showWarningMessage(`Plugin push failed — the package ID "${pluginId}" may not exist in Dataverse. Create a new plugin package?`, { modal: true }, 'Create New Package');
+    const nupkgPath = findNupkg(cwd);
+    if (!nupkgPath) {
+        throw new Error('No .nupkg file found after build. Ensure your project produces a NuGet package.');
+    }
+    log(`Found package: ${path.basename(nupkgPath)}`);
+    const orgUrl = await getPacOrgUrl();
+    log(`Target environment: ${orgUrl}`);
+    log('Authenticating with Dataverse...');
+    const scope = `${orgUrl.replace(/\/$/, '')}/.default`;
+    const session = await vscode.authentication.getSession('microsoft', [scope], { createIfNone: true });
+    if (!session) {
+        throw new Error('Authentication failed or was cancelled.');
+    }
+    const nupkgFilename = path.basename(nupkgPath);
+    const version = nupkgFilename.match(/\.(\d+\.\d+(?:\.\d+)*)\.nupkg$/)?.[1] ?? '1.0.0.0';
+    const packageContent = fs.readFileSync(nupkgPath).toString('base64');
+    log(`Updating plugin package ${packageId} v${version}...`);
+    try {
+        await updatePluginPackageRest(orgUrl, session.accessToken, packageId, version, packageContent);
+    }
+    catch (err) {
+        const choice = await vscode.window.showWarningMessage(`Plugin package update failed — the package ID "${packageId}" may not exist in Dataverse. Create a new plugin package?`, { modal: true }, 'Create New Package');
         if (choice !== 'Create New Package') {
-            throw new Error(`pac plugin push failed (exit ${exitCode})`);
+            throw err;
         }
         await createNewPluginPackage(csprojPath, configPath, config, log);
         return;
     }
     log('Refreshing plugin list...');
     try {
-        const orgUrl = await getPacOrgUrl();
-        const scope = `${orgUrl.replace(/\/$/, '')}/.default`;
-        const session = await vscode.authentication.getSession('microsoft', [scope], { createIfNone: false });
-        if (session && config.packages[projectName]) {
-            const plugins = await fetchPluginAssemblies(orgUrl, session.accessToken, pluginId);
+        if (config.packages[projectName]) {
+            const plugins = await fetchPluginAssemblies(orgUrl, session.accessToken, packageId);
             config.packages[projectName].plugins = plugins;
             (0, pluginConfig_1.savePluginConfig)(configPath, config);
             log(`  ${plugins.length} plugin(s) updated in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}`);
@@ -203,13 +195,44 @@ async function deployPackageToCrm(csprojPath, log) {
     catch (err) {
         log(`  Could not refresh plugin list: ${err instanceof Error ? err.message : String(err)}`);
     }
+    log('\nDeployment complete.');
+}
+async function checkPluginConfigSettings(configPath, config) {
+    const isBlank = (v) => !v?.trim() || /^<.+>$/.test(v.trim());
+    const missing = [];
+    if (isBlank(config.prefix)) {
+        missing.push('prefix');
+    }
+    if (isBlank(config.publisherName)) {
+        missing.push('publisherName');
+    }
+    if (isBlank(config.solutionUniqueName)) {
+        missing.push('solutionUniqueName');
+    }
+    if (missing.length === 0) {
+        return true;
+    }
+    if (isBlank(config.prefix)) {
+        config.prefix = '<publisher prefix ex: mx>';
+    }
+    if (isBlank(config.publisherName)) {
+        config.publisherName = '<publisher full name ex: Mx Dynamics>';
+    }
+    if (isBlank(config.solutionUniqueName)) {
+        config.solutionUniqueName = '<solution unique name>';
+    }
+    (0, pluginConfig_1.savePluginConfig)(configPath, config);
+    const doc = await vscode.workspace.openTextDocument(configPath);
+    await vscode.window.showTextDocument(doc);
+    vscode.window.showWarningMessage(`D365: Fill in the following fields in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}: ${missing.join(', ')}.`);
+    return false;
 }
 async function createNewPluginPackage(csprojPath, configPath, config, log) {
-    const projectName = path.basename(path.dirname(csprojPath));
-    const prefix = config.prefix?.trim();
-    if (!prefix) {
-        throw new Error(`"prefix" not set in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}.`);
+    if (!await checkPluginConfigSettings(configPath, config)) {
+        return;
     }
+    const projectName = path.basename(path.dirname(csprojPath));
+    const prefix = config.prefix.trim();
     const packageName = `${prefix}_${projectName}`;
     const cwd = path.dirname(csprojPath);
     log(`dotnet msbuild -t:Rebuild "${path.basename(csprojPath)}"`);
@@ -232,11 +255,27 @@ async function createNewPluginPackage(csprojPath, configPath, config, log) {
     }
     const nupkgFilename = path.basename(nupkgPath);
     const versionFromFilename = nupkgFilename.match(/\.(\d+\.\d+(?:\.\d+)*)\.nupkg$/)?.[1] ?? '1.0.0.0';
-    log(`Creating plugin package "${packageName}" v${versionFromFilename} in Dataverse...`);
     const packageContent = fs.readFileSync(nupkgPath).toString('base64');
-    const packageId = await createPluginPackageRest(orgUrl, session.accessToken, packageName, versionFromFilename, packageContent);
+    let packageId = await findExistingPackageId(orgUrl, session.accessToken, packageName);
+    if (packageId) {
+        log(`Found existing package "${packageName}" (${packageId}), updating content...`);
+        await updatePluginPackageRest(orgUrl, session.accessToken, packageId, versionFromFilename, packageContent);
+    }
+    else {
+        log(`Creating plugin package "${packageName}" v${versionFromFilename} in Dataverse...`);
+        packageId = await createPluginPackageRest(orgUrl, session.accessToken, packageName, versionFromFilename, packageContent);
+    }
     log(`  Package ID: ${packageId}`);
     (0, pluginConfig_1.setPackageEntry)(configPath, config, projectName, packageName, packageId);
+    const solutionUniqueName = config.solutionUniqueName.trim();
+    log(`Registering package in solution "${solutionUniqueName}"...`);
+    try {
+        await addSolutionComponentRest(orgUrl, session.accessToken, packageId, solutionUniqueName, 10041);
+        log(`  Package registered in solution "${solutionUniqueName}".`);
+    }
+    catch (err) {
+        log(`Warning: could not register package in solution: ${err instanceof Error ? err.message : String(err)}`);
+    }
     log('Fetching registered plugin assemblies...');
     const plugins = await fetchPluginAssemblies(orgUrl, session.accessToken, packageId);
     if (plugins.length > 0 && config.packages[projectName]) {
@@ -378,6 +417,12 @@ function getPacOrgUrl() {
         });
     });
 }
+async function findExistingPackageId(orgUrl, token, packageName) {
+    const query = `api/data/v9.2/pluginpackages?$filter=name eq '${encodeURIComponent(packageName)}'&$select=pluginpackageid`;
+    const data = await dataverseGet(orgUrl, token, query);
+    const values = data.value;
+    return values && values.length > 0 ? values[0].pluginpackageid : null;
+}
 function createPluginPackageRest(orgUrl, token, name, version, content) {
     const apiUrl = new URL('api/data/v9.2/pluginpackages', orgUrl);
     const body = JSON.stringify({ name, version, content });
@@ -410,6 +455,77 @@ function createPluginPackageRest(orgUrl, token, name, version, content) {
                         return;
                     }
                     resolve(m[1]);
+                }
+                else {
+                    reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+function updatePluginPackageRest(orgUrl, token, packageId, version, content) {
+    const apiUrl = new URL(`api/data/v9.2/pluginpackages(${packageId})`, orgUrl);
+    const body = JSON.stringify({ version, content });
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: apiUrl.hostname,
+            path: apiUrl.pathname,
+            method: 'PATCH',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'OData-MaxVersion': '4.0',
+                'OData-Version': '4.0',
+                'Accept': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk.toString(); });
+            res.on('end', () => {
+                if (res.statusCode === 204) {
+                    resolve();
+                }
+                else {
+                    reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+function addSolutionComponentRest(orgUrl, token, componentId, solutionUniqueName, componentType) {
+    const apiUrl = new URL('api/data/v9.2/AddSolutionComponent', orgUrl);
+    const body = JSON.stringify({
+        ComponentId: componentId,
+        ComponentType: componentType,
+        SolutionUniqueName: solutionUniqueName,
+        AddRequiredComponents: false,
+    });
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: apiUrl.hostname,
+            path: apiUrl.pathname,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'OData-MaxVersion': '4.0',
+                'OData-Version': '4.0',
+                'Accept': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk.toString(); });
+            res.on('end', () => {
+                if (res.statusCode === 200 || res.statusCode === 204) {
+                    resolve();
                 }
                 else {
                     reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`));
@@ -464,38 +580,127 @@ function runDiagnose(output) {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-function prepareStagingDir(workspaceRoot, settings) {
-    const stagingDir = path.join(workspaceRoot, 'build', 'deploy-staging');
-    fs.rmSync(stagingDir, { recursive: true, force: true });
-    const otherDir = path.join(stagingDir, 'Other');
-    fs.mkdirSync(otherDir, { recursive: true });
-    fs.writeFileSync(path.join(otherDir, 'Solution.xml'), (0, solution_xml_1.generateSolutionXml)(settings), 'utf8');
-    fs.writeFileSync(path.join(otherDir, 'Customizations.xml'), solution_xml_1.CUSTOMIZATIONS_TEMPLATE, 'utf8');
-    fs.writeFileSync(path.join(otherDir, 'Relationships.xml'), solution_xml_1.RELATIONSHIPS_TEMPLATE, 'utf8');
-    return stagingDir;
+async function getOrgAuth(log) {
+    const orgUrl = await getPacOrgUrl();
+    log(`Target environment: ${orgUrl}`);
+    const scope = `${orgUrl.replace(/\/$/, '')}/.default`;
+    const session = await vscode.authentication.getSession('microsoft', [scope], { createIfNone: true });
+    if (!session) {
+        throw new Error('Authentication failed or was cancelled.');
+    }
+    return { orgUrl, token: session.accessToken };
 }
-async function packAndImport(stagingDir, wrNames, solutionUniqueName, workspaceRoot, log) {
-    // Register web resources in XMLs
-    log('Registering web resources...');
-    (0, solution_xml_1.syncSolutionWebResources)(stagingDir, wrNames);
-    for (const name of wrNames) {
-        log(`  [Solution XML]   ${name}`);
+async function deployWebResourcesRest(files, solutionUniqueName, orgUrl, token, log) {
+    const updatedIds = [];
+    for (const { filePath, wrName } of files) {
+        const content = fs.readFileSync(filePath).toString('base64');
+        const id = await upsertWebResourceRest(orgUrl, token, wrName, content, solutionUniqueName, log);
+        updatedIds.push(id);
     }
-    // Pack
-    const buildDir = path.join(workspaceRoot, 'build');
-    fs.mkdirSync(buildDir, { recursive: true });
-    const solutionZipPath = path.join(buildDir, `${solutionUniqueName}.zip`);
-    log('Packing...');
-    const packStatus = await (0, pac_1.runPac)(['solution', 'pack', '--folder', stagingDir, '--zipfile', solutionZipPath, '--packagetype', 'Unmanaged'], workspaceRoot, log);
-    if (packStatus !== 0) {
-        throw new Error(`pac pack failed (status ${packStatus})`);
-    }
-    // Import + publish
-    log('Importing and publishing...');
-    const importStatus = await (0, pac_1.runPac)(['solution', 'import', '--path', solutionZipPath, '--publish-changes'], workspaceRoot, log);
-    if (importStatus !== 0) {
-        throw new Error(`pac import failed (status ${importStatus})`);
-    }
+    log('Publishing...');
+    await publishWebResourcesRest(orgUrl, token, updatedIds);
     log('\nDeployment complete.');
+}
+async function upsertWebResourceRest(orgUrl, token, wrName, content, solutionUniqueName, log) {
+    const filter = encodeURIComponent(`name eq '${wrName}'`);
+    const existing = await dataverseGet(orgUrl, token, `api/data/v9.2/webresourceset?$filter=${filter}&$select=webresourceid`);
+    const record = existing.value?.[0];
+    if (record) {
+        log(`  [UPDATE] ${wrName}`);
+        await patchWebResourceRest(orgUrl, token, record.webresourceid, content);
+        return record.webresourceid;
+    }
+    log(`  [CREATE] ${wrName}`);
+    const id = await createWebResourceRest(orgUrl, token, wrName, content, wrTypeFromName(wrName));
+    await addSolutionComponentRest(orgUrl, token, id, solutionUniqueName, 61);
+    return id;
+}
+function wrTypeFromName(name) {
+    if (name.endsWith('.js')) {
+        return 3;
+    }
+    if (name.endsWith('.map')) {
+        return 4;
+    }
+    if (name.endsWith('.css')) {
+        return 2;
+    }
+    if (name.endsWith('.html') || name.endsWith('.htm')) {
+        return 1;
+    }
+    if (name.endsWith('.png')) {
+        return 5;
+    }
+    if (name.endsWith('.jpg') || name.endsWith('.jpeg')) {
+        return 6;
+    }
+    if (name.endsWith('.gif')) {
+        return 7;
+    }
+    if (name.endsWith('.svg')) {
+        return 11;
+    }
+    if (name.endsWith('.ico')) {
+        return 10;
+    }
+    if (name.endsWith('.xsl') || name.endsWith('.xslt')) {
+        return 9;
+    }
+    if (name.endsWith('.resx')) {
+        return 12;
+    }
+    return 4;
+}
+function patchWebResourceRest(orgUrl, token, id, content) {
+    const apiUrl = new URL(`api/data/v9.2/webresourceset(${id})`, orgUrl);
+    const body = JSON.stringify({ content });
+    return new Promise((resolve, reject) => {
+        const req = https.request({ hostname: apiUrl.hostname, path: apiUrl.pathname, method: 'PATCH', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => res.statusCode === 204 ? resolve() : reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`)));
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+function createWebResourceRest(orgUrl, token, name, content, wrType) {
+    const apiUrl = new URL('api/data/v9.2/webresourceset', orgUrl);
+    const body = JSON.stringify({ name, displayname: path.basename(name), content, webresourcetype: wrType });
+    return new Promise((resolve, reject) => {
+        const req = https.request({ hostname: apiUrl.hostname, path: apiUrl.pathname, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0', 'Accept': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => {
+                if (res.statusCode === 201) {
+                    const entityId = res.headers['odata-entityid'];
+                    const m = entityId?.match(/\(([0-9a-f-]{36})\)/i);
+                    m ? resolve(m[1]) : reject(new Error(`Cannot parse web resource ID from: ${entityId}`));
+                }
+                else {
+                    reject(new Error(`Dataverse API error ${res.statusCode}: ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+function publishWebResourcesRest(orgUrl, token, ids) {
+    const apiUrl = new URL('api/data/v9.2/PublishXml', orgUrl);
+    const paramXml = `<importexportxml><webresources>${ids.map(id => `<webresource>{${id}}</webresource>`).join('')}</webresources></importexportxml>`;
+    const body = JSON.stringify({ ParameterXml: paramXml });
+    return new Promise((resolve, reject) => {
+        const req = https.request({ hostname: apiUrl.hostname, path: apiUrl.pathname, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'OData-MaxVersion': '4.0', 'OData-Version': '4.0', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => res.statusCode === 204 ? resolve() : reject(new Error(`Publish error ${res.statusCode}: ${data}`)));
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
 }
 //# sourceMappingURL=commands.js.map

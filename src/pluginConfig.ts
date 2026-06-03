@@ -34,6 +34,8 @@ export interface PackageEntry {
 
 export interface PluginDeploymentConfig {
     prefix: string;
+    publisherName?: string;
+    solutionUniqueName?: string;
     packages: Record<string, PackageEntry>;
 }
 
