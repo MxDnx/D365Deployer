@@ -1,3 +1,5 @@
 node_modules/
 out/
 *.vsix
+tools/PluginAnalyzer/bin/
+tools/PluginAnalyzer/obj/
