@@ -6,3 +6,5 @@ node_modules/**
 **/tsconfig.json
 **/*.map
 **/*.ts
+tools/PluginAnalyzer/bin/**
+tools/PluginAnalyzer/obj/**

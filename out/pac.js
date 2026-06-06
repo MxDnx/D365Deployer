@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.runPac = runPac;
 exports.runPacCapture = runPacCapture;
 exports.runDotnet = runDotnet;
+exports.runDotnetCapture = runDotnetCapture;
 exports.runNpmScript = runNpmScript;
 exports.collectTsFiles = collectTsFiles;
 exports.collectJsFiles = collectJsFiles;
@@ -91,6 +92,25 @@ function runDotnet(args, cwd, log) {
             }
         });
         proc.on('close', (code) => resolve(code ?? 0));
+    });
+}
+function runDotnetCapture(args, cwd, log) {
+    return new Promise((resolve) => {
+        const isWindows = process.platform === 'win32';
+        const [cmd, cmdArgs] = isWindows
+            ? ['cmd.exe', ['/c', 'dotnet', ...args]]
+            : ['dotnet', args];
+        let stdout = '';
+        const proc = (0, child_process_1.spawn)(cmd, cmdArgs, { cwd, shell: false });
+        proc.stdout.on('data', (data) => { stdout += data.toString(); });
+        proc.stderr.on('data', (data) => {
+            for (const line of data.toString().split(/\r?\n/)) {
+                if (line) {
+                    log(line);
+                }
+            }
+        });
+        proc.on('close', (code) => resolve({ code: code ?? 0, stdout }));
     });
 }
 // ---------------------------------------------------------------------------

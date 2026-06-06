@@ -30,6 +30,14 @@
       {
         "command": "d365WebResourceDeployer.deployPackageToCrm",
         "title": "Deploy Package To CRM"
+      },
+      {
+        "command": "d365WebResourceDeployer.deployPackageWithAttributes",
+        "title": "Deploy Package With Attributes"
+      },
+      {
+        "command": "d365WebResourceDeployer.switchAccount",
+        "title": "D365: Switch Account"
       }
     ],
     "menus": {
@@ -48,6 +56,11 @@
           "command": "d365WebResourceDeployer.deployPackageToCrm",
           "when": "explorerResourceIsFolder",
           "group": "1_build@3"
+        },
+        {
+          "command": "d365WebResourceDeployer.deployPackageWithAttributes",
+          "when": "explorerResourceIsFolder",
+          "group": "1_build@4"
         }
       ]
     },

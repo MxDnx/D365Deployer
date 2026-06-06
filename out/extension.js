@@ -64,7 +64,45 @@ function activate(context) {
             log(`\nError: ${msg}`);
             vscode.window.showErrorMessage(`Deploy All failed: ${msg}`);
         }
-    }), vscode.commands.registerCommand('d365WebResourceDeployer.diagnose', () => (0, commands_1.runDiagnose)(output)), vscode.commands.registerCommand('d365WebResourceDeployer.deployPackageToCrm', async (uri, uris) => {
+    }), vscode.commands.registerCommand('d365WebResourceDeployer.diagnose', () => (0, commands_1.runDiagnose)(output)), vscode.commands.registerCommand('d365WebResourceDeployer.switchAccount', async () => {
+        output.show(true);
+        output.appendLine('');
+        try {
+            await (0, commands_1.switchAccount)(log);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`\nError: ${msg}`);
+            vscode.window.showErrorMessage(`D365: Switch Account failed: ${msg}`);
+        }
+    }), vscode.commands.registerCommand('d365WebResourceDeployer.deployPackageWithAttributes', async (uri, uris) => {
+        const targets = uris && uris.length > 0 ? uris : (uri ? [uri] : []);
+        if (targets.length === 0) {
+            vscode.window.showErrorMessage('No folder selected.');
+            return;
+        }
+        output.show(true);
+        output.appendLine('');
+        try {
+            for (const target of targets) {
+                const files = fs.readdirSync(target.fsPath).filter((f) => f.endsWith('.csproj'));
+                if (files.length === 0) {
+                    vscode.window.showErrorMessage(`No .csproj found in ${path.basename(target.fsPath)}`);
+                    return;
+                }
+                if (files.length > 1) {
+                    vscode.window.showErrorMessage(`Multiple .csproj found in ${path.basename(target.fsPath)}`);
+                    return;
+                }
+                await (0, commands_1.deployPackageWithAttributes)(path.join(target.fsPath, files[0]), log);
+            }
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`\nError: ${msg}`);
+            vscode.window.showErrorMessage(`Plugin attribute analysis failed: ${msg}`);
+        }
+    }), vscode.commands.registerCommand('d365WebResourceDeployer.deployPackageToCrm', async (uri, uris) => {
         const targets = uris && uris.length > 0 ? uris : (uri ? [uri] : []);
         if (targets.length === 0) {
             vscode.window.showErrorMessage('No folder selected.');

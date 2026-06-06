@@ -84,6 +84,26 @@ export function runDotnet(args: string[], cwd: string, log: (msg: string) => voi
     });
 }
 
+export function runDotnetCapture(args: string[], cwd: string, log: (msg: string) => void): Promise<{ code: number; stdout: string }> {
+    return new Promise((resolve) => {
+        const isWindows = process.platform === 'win32';
+        const [cmd, cmdArgs]: [string, string[]] = isWindows
+            ? ['cmd.exe', ['/c', 'dotnet', ...args]]
+            : ['dotnet', args];
+
+        let stdout = '';
+        const proc = spawn(cmd, cmdArgs, { cwd, shell: false });
+
+        proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+        proc.stderr.on('data', (data: Buffer) => {
+            for (const line of data.toString().split(/\r?\n/)) {
+                if (line) { log(line); }
+            }
+        });
+        proc.on('close', (code) => resolve({ code: code ?? 0, stdout }));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // npm script runner
 // ---------------------------------------------------------------------------
