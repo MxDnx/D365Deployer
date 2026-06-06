@@ -2,7 +2,7 @@
   "name": "d365-deployer",
   "displayName": "D365 Deployer",
   "description": "Deploy web resources and packages to Dynamics 365 CE directly from the VS Code explorer context menu.",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "publisher": "MxDnx",
   "icon": "images/logo.png",
   "engines": {
