@@ -7,8 +7,13 @@ import { loadSettings, checkSettingsReady, SETTINGS_FILENAME } from './settings'
 import { runNpmScript, runDotnet, runDotnetCapture, collectJsFiles, collectStaticFiles } from './pac';
 import {
     PLUGIN_CONFIG_FILENAME, PluginDeploymentConfig, PluginEntry, StepEntry,
-    findPluginConfigPath, loadPluginConfig, savePluginConfig, getPackageId, setPackageEntry,
+    findPluginConfigPath, loadPluginConfig, savePluginConfig, getPackageId, getPackageEntry, setPackageEntry,
 } from './pluginConfig';
+
+/** Split a Dataverse CSV attribute string into the string[] shape used in the config. */
+function csv(value?: string): string[] {
+    return (value ?? '').split(',').map(s => s.trim()).filter(Boolean);
+}
 
 // ---------------------------------------------------------------------------
 // Deploy Package With Attributes — analyze, build, upload, sync steps/images
@@ -24,7 +29,7 @@ export async function deployPackageWithAttributes(csprojPath: string, log: (msg:
     if (!configPath) throw new Error(`${PLUGIN_CONFIG_FILENAME} not found. Run "Deploy Package To CRM" first.`);
     const config = loadPluginConfig(configPath);
     const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const packageId = getPackageId(config, projectName) ?? '';
+    const packageId = getPackageId(config) ?? '';
     if (!packageId || !GUID_RE.test(packageId)) {
         throw new Error(`No valid package ID for "${projectName}". Run "Deploy Package To CRM" first.`);
     }
@@ -66,34 +71,58 @@ export async function deployPackageWithAttributes(csprojPath: string, log: (msg:
     // 3. Fetch current Dataverse state
     log('\nFetching plugin assemblies...');
     const plugins = await fetchPluginAssemblies(orgUrl, token, packageId);
-    if (config.packages[projectName]) {
-        config.packages[projectName].plugins = plugins;
+    const pkgEntry = getPackageEntry(config);
+    if (pkgEntry) {
+        pkgEntry.plugins = plugins;
         savePluginConfig(configPath, config);
     }
 
     // 4. Sync steps & pre-images
+    const solvedStepIds: string[] = [];
     for (const r of analysisResults) {
         log(`\nSyncing [${r.className}]...`);
         const filteringAttr = r.targetFields.join(',');
         const preImageAttr  = r.preImageFields.join(',');
 
+        // Match the existing step on the exact name produced at creation time
+        // (`${className}: ${message} of ${entity}`). The previous `.${className}:`
+        // substring expected a namespaced name that creation never emits, so the
+        // lookup always missed and every redeploy created a duplicate step/image.
+        const expectedStepName = `${r.className}: ${r.pluginStep.message} of ${r.pluginStep.entityName}`;
         let matchingStep: StepEntry | undefined;
         for (const plugin of plugins) {
-            matchingStep = (plugin.steps ?? []).find(s => s.name.includes(`.${r.className}:`));
+            matchingStep = (plugin.steps ?? []).find(s => s.name === expectedStepName);
             if (matchingStep) break;
         }
 
         if (matchingStep) {
-            await patchPluginStep(orgUrl, token, matchingStep.stepId, filteringAttr);
-            log(`  filteringAttributes → ${filteringAttr || '(all)'}`);
+            // Idempotent update path. Each Dataverse write is best-effort: the step and
+            // image already carry the right values from creation, so a redundant PATCH/POST
+            // that the platform rejects (e.g. 0x80040216) must not abort the whole deploy.
+            solvedStepIds.push(matchingStep.stepId);
+            const tryWrite = async (label: string, fn: () => Promise<unknown>) => {
+                try { await fn(); log(`  ${label}`); }
+                catch (e) { log(`  ${label} → skipped (${e instanceof Error ? e.message : String(e)})`); }
+            };
+
+            if (filteringAttr) {
+                await tryWrite(`filteringAttributes → ${filteringAttr}`, () =>
+                    patchPluginStep(orgUrl, token, matchingStep!.stepId, filteringAttr));
+            } else {
+                log(`  filteringAttributes → (no [Target] in source — skipping, user manages manually)`);
+            }
 
             const preImg = matchingStep.preImages?.[0];
             if (preImg) {
-                await patchPreImage(orgUrl, token, preImg.imageId, preImageAttr);
-                log(`  preImage.attributes → ${preImageAttr || '(all)'}`);
+                if (preImageAttr) {
+                    await tryWrite(`preImage.attributes → ${preImageAttr}`, () =>
+                        patchPreImage(orgUrl, token, preImg.imageId, preImageAttr));
+                } else {
+                    log(`  preImage.attributes → (no [PreImage] in source — skipping, user manages manually)`);
+                }
             } else if (preImageAttr) {
-                await createPreImage(orgUrl, token, matchingStep.stepId, preImageAttr);
-                log(`  Created preImage → ${preImageAttr}`);
+                await tryWrite(`Created preImage → ${preImageAttr}`, () =>
+                    createPreImage(orgUrl, token, matchingStep!.stepId, preImageAttr));
             }
         } else {
             log(`  Step not found — creating...`);
@@ -107,7 +136,7 @@ export async function deployPackageWithAttributes(csprojPath: string, log: (msg:
             if (!sdkFilterId) { log(`  Message filter for "${r.pluginStep.entityName}" not found, skipping.`); continue; }
 
             const newStepId = await createPluginStep(orgUrl, token, {
-                name: `${r.className}: ${r.pluginStep.message} of ${r.pluginStep.entityName}`,
+                name: expectedStepName,
                 mode: r.pluginStep.isAsync ? 1 : 0,
                 stage: stageToInt(r.pluginStep.stage),
                 rank: r.pluginStep.order,
@@ -115,6 +144,7 @@ export async function deployPackageWithAttributes(csprojPath: string, log: (msg:
                 pluginTypeId, sdkMessageId, sdkFilterId,
             });
             log(`  Created step ${newStepId}`);
+            solvedStepIds.push(newStepId);
 
             if (preImageAttr) {
                 await createPreImage(orgUrl, token, newStepId, preImageAttr);
@@ -123,11 +153,28 @@ export async function deployPackageWithAttributes(csprojPath: string, log: (msg:
         }
     }
 
+    // Add every synced step to the configured solution (type 92), best-effort.
+    // Re-adding a member already in the solution is rejected by Dataverse
+    // (0x80040216) on an idempotent redeploy, so treat any add failure as a skip.
+    const solutionUniqueName = config.solutionUniqueName?.trim();
+    if (solutionUniqueName && !/^<.+>$/.test(solutionUniqueName) && solvedStepIds.length > 0) {
+        log(`\nAdding ${solvedStepIds.length} step(s) to solution "${solutionUniqueName}"...`);
+        for (const id of solvedStepIds) {
+            try {
+                await addSolutionComponentRest(orgUrl, token, id, solutionUniqueName, 92);
+                log(`  Step ${id} → added (type 92)`);
+            } catch (e) {
+                log(`  Step ${id} → already in solution (skipped: ${e instanceof Error ? e.message : String(e)})`);
+            }
+        }
+    }
+
     // Refresh config with final state
     try {
         const refreshed = await fetchPluginAssemblies(orgUrl, token, packageId);
-        if (config.packages[projectName]) {
-            config.packages[projectName].plugins = refreshed;
+        const refreshEntry = getPackageEntry(config);
+        if (refreshEntry) {
+            refreshEntry.plugins = refreshed;
             savePluginConfig(configPath, config);
             log(`\n${PLUGIN_CONFIG_FILENAME} updated.`);
         }
@@ -191,7 +238,7 @@ interface NewStepConfig {
 function createPluginStep(orgUrl: string, token: string, cfg: NewStepConfig): Promise<string> {
     return dataversePost(orgUrl, token, 'api/data/v9.2/sdkmessageprocessingsteps', {
         name: cfg.name, mode: cfg.mode, stage: cfg.stage, rank: cfg.rank,
-        filteringattributes: cfg.filteringAttributes,
+        ...(cfg.filteringAttributes ? { filteringattributes: cfg.filteringAttributes } : {}),
         'eventhandler_plugintype@odata.bind': `/plugintypes(${cfg.pluginTypeId})`,
         'sdkmessageid@odata.bind':       `/sdkmessages(${cfg.sdkMessageId})`,
         'sdkmessagefilterid@odata.bind': `/sdkmessagefilters(${cfg.sdkFilterId})`,
@@ -345,8 +392,6 @@ export interface PluginProject {
 }
 
 export function findPluginProjects(rootPath: string): PluginProject[] {
-    const configPath = findPluginConfigPath(rootPath);
-    const config = configPath ? loadPluginConfig(configPath) : null;
     const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const results: PluginProject[] = [];
 
@@ -361,7 +406,10 @@ export function findPluginProjects(rootPath: string): PluginProject[] {
                 scan(fullPath);
             } else if (entry.isFile() && entry.name.endsWith('.csproj')) {
                 const projectName = path.basename(path.dirname(fullPath));
-                const pluginId = config ? (getPackageId(config, projectName) ?? '') : '';
+                // Per-project convention: the config sits next to the .csproj.
+                const configPath = findPluginConfigPath(fullPath);
+                const config = configPath ? loadPluginConfig(configPath) : null;
+                const pluginId = config ? (getPackageId(config) ?? '') : '';
                 if (pluginId && GUID_RE.test(pluginId)) {
                     const relDir = path.relative(rootPath, path.dirname(fullPath)) || projectName;
                     results.push({ label: relDir, description: pluginId, csprojPath: fullPath, pluginId });
@@ -383,12 +431,12 @@ export async function deployPackageToCrm(csprojPath: string, log: (msg: string) 
     const configPath = findPluginConfigPath(csprojPath);
     if (!configPath) {
         throw new Error(
-            `${PLUGIN_CONFIG_FILENAME} not found. Create it at your solution root with "prefix" and "plugins".`
+            `${PLUGIN_CONFIG_FILENAME} not found. Create it next to the .csproj with "prefix" and "packages".`
         );
     }
     const config = loadPluginConfig(configPath);
     const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const packageId = getPackageId(config, projectName) ?? '';
+    const packageId = getPackageId(config) ?? '';
 
     if (!packageId || !GUID_RE.test(packageId)) {
         await createNewPluginPackage(csprojPath, configPath, config, log);
@@ -434,9 +482,10 @@ export async function deployPackageToCrm(csprojPath: string, log: (msg: string) 
 
     log('Refreshing plugin list...');
     try {
-        if (config.packages[projectName]) {
+        const pkgEntry = getPackageEntry(config);
+        if (pkgEntry) {
             const plugins = await fetchPluginAssemblies(orgUrl, accessToken, packageId);
-            config.packages[projectName].plugins = plugins;
+            pkgEntry.plugins = plugins;
             savePluginConfig(configPath, config);
             log(`  ${plugins.length} plugin(s) updated in ${PLUGIN_CONFIG_FILENAME}`);
         }
@@ -512,7 +561,7 @@ async function createNewPluginPackage(
     }
     log(`  Package ID: ${packageId}`);
 
-    setPackageEntry(configPath, config, projectName, packageName, packageId);
+    setPackageEntry(configPath, config, packageName, packageId);
 
     const solutionUniqueName = config.solutionUniqueName!.trim();
     log(`Registering package in solution "${solutionUniqueName}"...`);
@@ -525,8 +574,9 @@ async function createNewPluginPackage(
 
     log('Fetching registered plugin assemblies...');
     const plugins = await fetchPluginAssemblies(orgUrl, accessToken, packageId);
-    if (plugins.length > 0 && config.packages[projectName]) {
-        config.packages[projectName].plugins = plugins;
+    const createdEntry = getPackageEntry(config);
+    if (plugins.length > 0 && createdEntry) {
+        createdEntry.plugins = plugins;
         savePluginConfig(configPath, config);
         for (const p of plugins) { log(`  Plugin: ${p.name} (${p.pluginId})`); }
     }
@@ -592,7 +642,7 @@ async function fetchPluginAssemblies(orgUrl: string, token: string, packageId: s
             mode: s.mode,
             stage: s.stage,
             rank: s.rank,
-            filteringAttributes: s.filteringattributes ?? '',
+            filteringAttributes: csv(s.filteringattributes),
             preImages: [],
             postImages: [],
         }));
@@ -615,7 +665,7 @@ async function fetchPluginAssemblies(orgUrl: string, token: string, packageId: s
         for (const i of (imagesData.value ?? []) as RawImage[]) {
             const step = stepMap.get((i as RawImage & { _sdkmessageprocessingstepid_value: string })._sdkmessageprocessingstepid_value);
             if (!step) { continue; }
-            const image = { imageId: i.sdkmessageprocessingstepimageid, name: i.name, attributes: i.attributes ?? '' };
+            const image = { imageId: i.sdkmessageprocessingstepimageid, name: i.name, attributes: csv(i.attributes) };
             if (i.imagetype === 0 || i.imagetype === 2) { step.preImages!.push(image); }
             if (i.imagetype === 1 || i.imagetype === 2) { step.postImages!.push(image); }
         }
@@ -988,7 +1038,7 @@ function createWebResourceRest(orgUrl: string, token: string, name: string, cont
             (res) => {
                 let data = ''; res.on('data', (c: Buffer) => { data += c; });
                 res.on('end', () => {
-                    if (res.statusCode === 201) {
+                    if (res.statusCode === 201 || res.statusCode === 204) {
                         const entityId = res.headers['odata-entityid'] as string | undefined;
                         const m = entityId?.match(/\(([0-9a-f-]{36})\)/i);
                         m ? resolve(m[1]) : reject(new Error(`Cannot parse web resource ID from: ${entityId}`));

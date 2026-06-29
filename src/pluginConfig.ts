@@ -1,12 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-export const PLUGIN_CONFIG_FILENAME = 'PluginDeploymentConfig.json';
+// Matches the pluginDeploymentConfig.json shape produced by the MxMcpDataverse MCP:
+//   one file per plugin project, sitting next to the .csproj (lowercase filename).
+//   top-level packageId (back-compat) + prefix/publisherName/solutionUniqueName +
+//   packages[] → plugins[] → steps[] → pre/postImages[].
+//   filteringAttributes and image attributes are string arrays (not CSV strings).
+export const PLUGIN_CONFIG_FILENAME = 'pluginDeploymentConfig.json';
 
 export interface ImageEntry {
     imageId: string;
     name: string;
-    attributes: string;
+    attributes: string[];
 }
 
 export interface StepEntry {
@@ -15,7 +20,7 @@ export interface StepEntry {
     mode: number;
     stage: number;
     rank: number;
-    filteringAttributes: string;
+    filteringAttributes: string[];
     preImages?: ImageEntry[];
     postImages?: ImageEntry[];
 }
@@ -33,21 +38,21 @@ export interface PackageEntry {
 }
 
 export interface PluginDeploymentConfig {
+    packageId?: string; // kept top-level for back-compat with the MCP output
     prefix: string;
     publisherName?: string;
     solutionUniqueName?: string;
-    packages: Record<string, PackageEntry>;
+    packages: PackageEntry[];
 }
 
+/**
+ * Resolve the pluginDeploymentConfig.json that sits in the same directory as the
+ * given path (per-project convention — no walking up the tree).
+ */
 export function findPluginConfigPath(fromPath: string): string | null {
-    let dir = fs.statSync(fromPath).isDirectory() ? fromPath : path.dirname(fromPath);
-    const { root } = path.parse(dir);
-    while (dir !== root) {
-        const candidate = path.join(dir, PLUGIN_CONFIG_FILENAME);
-        if (fs.existsSync(candidate)) { return candidate; }
-        dir = path.dirname(dir);
-    }
-    return null;
+    const dir = fs.statSync(fromPath).isDirectory() ? fromPath : path.dirname(fromPath);
+    const candidate = path.join(dir, PLUGIN_CONFIG_FILENAME);
+    return fs.existsSync(candidate) ? candidate : null;
 }
 
 export function loadPluginConfig(configPath: string): PluginDeploymentConfig {
@@ -58,18 +63,23 @@ export function savePluginConfig(configPath: string, config: PluginDeploymentCon
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
 }
 
-export function getPackageId(config: PluginDeploymentConfig, projectName: string): string | undefined {
-    return config.packages?.[projectName]?.packageId;
+/** Per-project config holds a single package — return it (or undefined). */
+export function getPackageEntry(config: PluginDeploymentConfig): PackageEntry | undefined {
+    return config.packages?.[0];
+}
+
+export function getPackageId(config: PluginDeploymentConfig): string | undefined {
+    return getPackageEntry(config)?.packageId ?? config.packageId;
 }
 
 export function setPackageEntry(
     configPath: string,
     config: PluginDeploymentConfig,
-    projectName: string,
     name: string,
     packageId: string
 ): void {
-    if (!config.packages) { config.packages = {}; }
-    config.packages[projectName] = { name, packageId };
+    const existingPlugins = getPackageEntry(config)?.plugins ?? [];
+    config.packageId = packageId;
+    config.packages = [{ name, packageId, plugins: existingPlugins }];
     savePluginConfig(configPath, config);
 }
