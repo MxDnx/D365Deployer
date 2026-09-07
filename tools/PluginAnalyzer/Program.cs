@@ -36,9 +36,14 @@ foreach (var (filePath, tree) in allTrees)
             .SelectMany(al => al.Attributes)
             .FirstOrDefault(a => { var n = a.Name.ToString(); return n == "PluginStep" || n.EndsWith(".PluginStep"); });
 
-        if (stepAttr is null) continue;
+        var customApiAttr = cls.AttributeLists
+            .SelectMany(al => al.Attributes)
+            .FirstOrDefault(a => { var n = a.Name.ToString(); return n == "CustomApiStep" || n.EndsWith(".CustomApiStep"); });
 
-        var stepInfo       = ParsePluginStep(stepAttr, constMap);
+        if (stepAttr is null && customApiAttr is null) continue;
+
+        var stepInfo       = stepAttr      is not null ? ParsePluginStep(stepAttr, constMap)         : null;
+        var customApiInfo  = customApiAttr is not null ? ParseCustomApiStep(customApiAttr, constMap) : null;
         var targetFields   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var preImageFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -62,7 +67,7 @@ foreach (var (filePath, tree) in allTrees)
         }
 
         results.Add(new PluginResult(
-            cls.Identifier.Text, stepInfo,
+            cls.Identifier.Text, stepInfo, customApiInfo,
             targetFields.ToList(), preImageFields.ToList()));
     }
 }
@@ -178,6 +183,34 @@ static PluginStepInfo ParsePluginStep(AttributeSyntax attr, Dictionary<string, s
     return new PluginStepInfo(entity, message, stage, isAsync, order);
 }
 
+static CustomApiStepInfo ParseCustomApiStep(AttributeSyntax attr, Dictionary<string, string> constMap)
+{
+    var args = attr.ArgumentList?.Arguments.ToList() ?? new List<AttributeArgumentSyntax>();
+
+    var uniqueName  = args.Count > 0 ? ResolveExpr(args[0].Expression, constMap) : "";
+    var displayName = args.Count > 1 ? ResolveExpr(args[1].Expression, constMap) : uniqueName;
+    var description = args.Count > 2 ? ResolveExpr(args[2].Expression, constMap) : "";
+
+    // allowedStepType: int literal (0/1/2) or enum member name (None/AsyncOnly/SyncAndAsync)
+    var stepType = 2;
+    if (args.Count > 3)
+    {
+        var raw = args[3].Expression;
+        if (!int.TryParse(raw.ToString(), out stepType))
+        {
+            var name = raw switch
+            {
+                MemberAccessExpressionSyntax m => m.Name.Identifier.Text,
+                IdentifierNameSyntax id        => id.Identifier.Text,
+                _                              => raw.ToString()
+            };
+            stepType = name switch { "None" => 0, "AsyncOnly" => 1, _ => 2 };
+        }
+    }
+
+    return new CustomApiStepInfo(uniqueName, displayName, description, stepType);
+}
+
 static IEnumerable<string> CollectCsFiles(string dir)
 {
     foreach (var entry in Directory.EnumerateFileSystemEntries(dir))
@@ -201,9 +234,17 @@ record PluginStepInfo(
     [property: JsonPropertyName("order")]      int    Order
 );
 
+record CustomApiStepInfo(
+    [property: JsonPropertyName("uniqueName")]      string UniqueName,
+    [property: JsonPropertyName("displayName")]     string DisplayName,
+    [property: JsonPropertyName("description")]     string Description,
+    [property: JsonPropertyName("allowedStepType")] int    AllowedStepType
+);
+
 record PluginResult(
-    [property: JsonPropertyName("className")]      string         ClassName,
-    [property: JsonPropertyName("pluginStep")]     PluginStepInfo PluginStep,
-    [property: JsonPropertyName("targetFields")]   List<string>   TargetFields,
-    [property: JsonPropertyName("preImageFields")] List<string>   PreImageFields
+    [property: JsonPropertyName("className")]      string             ClassName,
+    [property: JsonPropertyName("pluginStep")]     PluginStepInfo?    PluginStep,
+    [property: JsonPropertyName("customApiStep")]  CustomApiStepInfo? CustomApiStep,
+    [property: JsonPropertyName("targetFields")]   List<string>       TargetFields,
+    [property: JsonPropertyName("preImageFields")] List<string>       PreImageFields
 );

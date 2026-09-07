@@ -45,13 +45,18 @@ async function deployPackageWithAttributes(csprojPath, log) {
         throw new Error(`PluginAnalyzer exited with code ${code}`);
     const analysisResults = JSON.parse(stdout.trim());
     if (analysisResults.length === 0) {
-        log('No [PluginStep] classes found.');
+        log('No [PluginStep] or [CustomApiStep] classes found.');
         return;
     }
     for (const r of analysisResults) {
-        log(`\n  [${r.className}]  entity=${r.pluginStep.entityName}  msg=${r.pluginStep.message}  stage=${r.pluginStep.stage}`);
-        log(`    Target:   ${r.targetFields.join(', ') || '(all)'}`);
-        log(`    PreImage: ${r.preImageFields.join(', ') || '(none)'}`);
+        if (r.customApiStep) {
+            log(`\n  [${r.className}]  CustomAPI=${r.customApiStep.uniqueName}`);
+        }
+        else if (r.pluginStep) {
+            log(`\n  [${r.className}]  entity=${r.pluginStep.entityName}  msg=${r.pluginStep.message}  stage=${r.pluginStep.stage}`);
+            log(`    Target:   ${r.targetFields.join(', ') || '(all)'}`);
+            log(`    PreImage: ${r.preImageFields.join(', ') || '(none)'}`);
+        }
     }
     // 2. Build + upload
     log(`\nBuilding ${projectName}...`);
@@ -68,16 +73,26 @@ async function deployPackageWithAttributes(csprojPath, log) {
     await updatePluginPackageRest(orgUrl, token, packageId, version, fs.readFileSync(nupkgPath).toString('base64'));
     // 3. Fetch current Dataverse state
     log('\nFetching plugin assemblies...');
-    const plugins = await fetchPluginAssemblies(orgUrl, token, packageId);
+    const plugins = await fetchPluginTypes(orgUrl, token, packageId);
     const pkgEntry = (0, pluginConfig_1.getPackageEntry)(config);
     if (pkgEntry) {
         pkgEntry.plugins = plugins;
         (0, pluginConfig_1.savePluginConfig)(configPath, config);
     }
     // 4. Sync steps & pre-images
+    const rawSolutionName = config.solutionUniqueName?.trim();
+    const solutionUniqueName = rawSolutionName && !/^<.+>$/.test(rawSolutionName) ? rawSolutionName : undefined;
     const solvedStepIds = [];
     for (const r of analysisResults) {
         log(`\nSyncing [${r.className}]...`);
+        if (r.customApiStep) {
+            await syncCustomApiStep(orgUrl, token, plugins, r.className, r.customApiStep, solutionUniqueName, log);
+            continue;
+        }
+        if (!r.pluginStep) {
+            log('  No step info, skipping.');
+            continue;
+        }
         const filteringAttr = r.targetFields.join(',');
         const preImageAttr = r.preImageFields.join(',');
         // Match the existing step on the exact name produced at creation time
@@ -114,7 +129,16 @@ async function deployPackageWithAttributes(csprojPath, log) {
             const preImg = matchingStep.preImages?.[0];
             if (preImg) {
                 if (preImageAttr) {
-                    await tryWrite(`preImage.attributes → ${preImageAttr}`, () => patchPreImage(orgUrl, token, preImg.imageId, preImageAttr));
+                    // Same attribute list → nothing to write. When it differs, the whole image
+                    // is sent (a partial PATCH of a step image is refused with 0x80040216).
+                    const sameAttrs = [...(preImg.attributes ?? [])].map(s => s.trim()).sort().join(',')
+                        === preImageAttr.split(',').map(s => s.trim()).sort().join(',');
+                    if (sameAttrs) {
+                        log(`  preImage.attributes → unchanged (${preImageAttr})`);
+                    }
+                    else {
+                        await tryWrite(`preImage.attributes → ${preImageAttr}`, () => patchPreImage(orgUrl, token, preImg.imageId, matchingStep.stepId, preImageAttr));
+                    }
                 }
                 else {
                     log(`  preImage.attributes → (no [PreImage] in source — skipping, user manages manually)`);
@@ -126,7 +150,7 @@ async function deployPackageWithAttributes(csprojPath, log) {
         }
         else {
             log(`  Step not found — creating...`);
-            const pluginTypeId = await fetchPluginTypeId(orgUrl, token, plugins, r.className);
+            const pluginTypeId = findPluginTypeId(plugins, r.className);
             if (!pluginTypeId) {
                 log(`  Plugin type not found, skipping.`);
                 continue;
@@ -160,8 +184,7 @@ async function deployPackageWithAttributes(csprojPath, log) {
     // Add every synced step to the configured solution (type 92), best-effort.
     // Re-adding a member already in the solution is rejected by Dataverse
     // (0x80040216) on an idempotent redeploy, so treat any add failure as a skip.
-    const solutionUniqueName = config.solutionUniqueName?.trim();
-    if (solutionUniqueName && !/^<.+>$/.test(solutionUniqueName) && solvedStepIds.length > 0) {
+    if (solutionUniqueName && solvedStepIds.length > 0) {
         log(`\nAdding ${solvedStepIds.length} step(s) to solution "${solutionUniqueName}"...`);
         for (const id of solvedStepIds) {
             try {
@@ -175,7 +198,7 @@ async function deployPackageWithAttributes(csprojPath, log) {
     }
     // Refresh config with final state
     try {
-        const refreshed = await fetchPluginAssemblies(orgUrl, token, packageId);
+        const refreshed = await fetchPluginTypes(orgUrl, token, packageId);
         const refreshEntry = (0, pluginConfig_1.getPackageEntry)(config);
         if (refreshEntry) {
             refreshEntry.plugins = refreshed;
@@ -199,8 +222,13 @@ function stageToInt(stage) {
 function patchPluginStep(orgUrl, token, stepId, filteringAttributes) {
     return dataversePatch(orgUrl, token, `api/data/v9.2/sdkmessageprocessingsteps(${stepId})`, { filteringattributes: filteringAttributes });
 }
-function patchPreImage(orgUrl, token, imageId, attributes) {
-    return dataversePatch(orgUrl, token, `api/data/v9.2/sdkmessageprocessingstepimages(${imageId})`, { attributes });
+function patchPreImage(orgUrl, token, imageId, stepId, attributes) {
+    // Dataverse refuses a PARTIAL update of a step image (0x80040216 "The image ... cannot be updated"):
+    // the whole image must be sent, exactly like the Plugin Registration Tool does.
+    return dataversePatch(orgUrl, token, `api/data/v9.2/sdkmessageprocessingstepimages(${imageId})`, {
+        name: 'PreImage', entityalias: 'PreImage', imagetype: 0, attributes, messagepropertyname: 'Target',
+        'sdkmessageprocessingstepid@odata.bind': `/sdkmessageprocessingsteps(${stepId})`,
+    });
 }
 function createPreImage(orgUrl, token, stepId, attributes) {
     return dataversePost(orgUrl, token, 'api/data/v9.2/sdkmessageprocessingstepimages', {
@@ -208,15 +236,10 @@ function createPreImage(orgUrl, token, stepId, attributes) {
         'sdkmessageprocessingstepid@odata.bind': `/sdkmessageprocessingsteps(${stepId})`,
     });
 }
-async function fetchPluginTypeId(orgUrl, token, plugins, className) {
-    for (const plugin of plugins) {
-        const data = await dataverseGet(orgUrl, token, `api/data/v9.2/plugintypes?$filter=_pluginassemblyid_value eq '${plugin.pluginId}'&$select=plugintypeid,typename`);
-        const types = data.value ?? [];
-        const match = types.find(t => t.typename === className || t.typename.endsWith(`.${className}`));
-        if (match)
-            return match.plugintypeid;
-    }
-    return null;
+// Entries from fetchPluginTypes are already plugin types — match the class name directly.
+function findPluginTypeId(plugins, className) {
+    const match = plugins.find(p => p.name === className || p.name.endsWith(`.${className}`));
+    return match?.pluginId ?? null;
 }
 async function fetchSdkMessageId(orgUrl, token, messageName) {
     const data = await dataverseGet(orgUrl, token, `api/data/v9.2/sdkmessages?$filter=name eq '${messageName}'&$select=sdkmessageid`);
@@ -254,7 +277,7 @@ function dataversePatch(orgUrl, token, relativeUrl, body) {
         req.end();
     });
 }
-function dataversePost(orgUrl, token, relativeUrl, body) {
+function dataversePost(orgUrl, token, relativeUrl, body, extraHeaders) {
     const apiUrl = new URL(relativeUrl, orgUrl);
     const bodyStr = JSON.stringify(body);
     return new Promise((resolve, reject) => {
@@ -262,7 +285,7 @@ function dataversePost(orgUrl, token, relativeUrl, body) {
             hostname: apiUrl.hostname, path: apiUrl.pathname, method: 'POST',
             headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json',
                 'OData-MaxVersion': '4.0', 'OData-Version': '4.0', 'Accept': 'application/json',
-                'Content-Length': Buffer.byteLength(bodyStr) },
+                'Content-Length': Buffer.byteLength(bodyStr), ...(extraHeaders ?? {}) },
         }, (res) => {
             let data = '';
             res.on('data', (c) => { data += c; });
@@ -280,6 +303,114 @@ function dataversePost(orgUrl, token, relativeUrl, body) {
         req.write(bodyStr);
         req.end();
     });
+}
+function dataverseDelete(orgUrl, token, relativeUrl) {
+    const apiUrl = new URL(relativeUrl, orgUrl);
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: apiUrl.hostname, path: apiUrl.pathname, method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${token}`, 'OData-MaxVersion': '4.0', 'OData-Version': '4.0' },
+        }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => res.statusCode === 204 ? resolve() : reject(new Error(`DELETE ${res.statusCode}: ${data}`)));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+// ─── Custom API sync ─────────────────────────────────────────────────────────
+async function syncCustomApiStep(orgUrl, token, plugins, className, api, solutionUniqueName, log) {
+    // 1. Ensure the Custom API exists — create it if missing
+    let sdkMessageId = await fetchSdkMessageId(orgUrl, token, api.uniqueName);
+    if (!sdkMessageId) {
+        log(`  Custom API "${api.uniqueName}" not found — creating...`);
+        await createCustomApiRest(orgUrl, token, api, solutionUniqueName);
+        // Dataverse creates the sdkmessage record asynchronously — retry a few times
+        for (let attempt = 0; attempt < 5 && !sdkMessageId; attempt++) {
+            await new Promise(r => setTimeout(r, 1500));
+            sdkMessageId = await fetchSdkMessageId(orgUrl, token, api.uniqueName);
+        }
+        if (!sdkMessageId) {
+            log(`  Error: SDK message for "${api.uniqueName}" still not found after creation.`);
+            return;
+        }
+        log(`  Custom API created → sdkMessageId ${sdkMessageId}`);
+    }
+    else {
+        log(`  Custom API already exists → sdkMessageId ${sdkMessageId}`);
+    }
+    // 2. Resolve the plugin type that handles this Custom API.
+    const pluginTypeId = findPluginTypeId(plugins, className);
+    if (!pluginTypeId) {
+        log('  Plugin type not found, skipping.');
+        return;
+    }
+    // 3. Wire the Custom API to its plugin type. That is ALL a Custom API needs:
+    //    the platform maintains its own internal stage-30 "CustomApi '<name>'
+    //    implementation" step from customapi.plugintypeid. Registering an explicit
+    //    stage-40 step on top makes the handler execute TWICE per call — so wire
+    //    the binding, never create a step.
+    const apiData = await dataverseGet(orgUrl, token, `api/data/v9.2/customapis?$filter=${encodeURIComponent(`uniquename eq '${api.uniqueName}'`)}&$select=customapiid,_plugintypeid_value`);
+    const apiRecord = apiData.value?.[0];
+    if (!apiRecord) {
+        log(`  Warning: customapi record for "${api.uniqueName}" not found.`);
+        return;
+    }
+    if (apiRecord._plugintypeid_value === pluginTypeId) {
+        log('  plugintypeid already wired.');
+    }
+    else {
+        // Nav property is PascalCase — 'plugintypeid' is rejected by OData.
+        await dataversePatch(orgUrl, token, `api/data/v9.2/customapis(${apiRecord.customapiid})`, {
+            'PluginTypeId@odata.bind': `/plugintypes(${pluginTypeId})`,
+        });
+        log(`  Wired plugintypeid → ${pluginTypeId}`);
+    }
+    // 4. Remove legacy explicit stage-40 steps for this type + message — each one
+    //    is an extra execution per call.
+    const stepFilter = `_plugintypeid_value eq '${pluginTypeId}' and _sdkmessageid_value eq '${sdkMessageId}' and stage eq 40`;
+    const legacy = await dataverseGet(orgUrl, token, `api/data/v9.2/sdkmessageprocessingsteps?$filter=${encodeURIComponent(stepFilter)}&$select=sdkmessageprocessingstepid`);
+    for (const s of (legacy.value ?? [])) {
+        try {
+            await dataverseDelete(orgUrl, token, `api/data/v9.2/sdkmessageprocessingsteps(${s.sdkmessageprocessingstepid})`);
+            log(`  Deleted duplicate explicit step ${s.sdkmessageprocessingstepid} (the platform implementation step handles the call).`);
+        }
+        catch (e) {
+            log(`  Could not delete explicit step ${s.sdkmessageprocessingstepid}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    // Nothing to add to the solution: the customapi component carries the binding.
+}
+/** Creates a Global (unbound) Custom API with the JSON input/output string contract. */
+async function createCustomApiRest(orgUrl, token, api, solutionUniqueName) {
+    const solutionHeader = solutionUniqueName ? { 'MSCRM.SolutionUniqueName': solutionUniqueName } : undefined;
+    const apiId = await dataversePost(orgUrl, token, 'api/data/v9.2/customapis', {
+        uniquename: api.uniqueName,
+        name: api.uniqueName,
+        displayname: api.displayName || api.uniqueName,
+        description: api.description ?? '',
+        allowedcustomprocessingsteptype: api.allowedStepType ?? 2,
+        bindingtype: 0, // Global (unbound)
+        isfunction: false,
+        isprivate: false,
+    }, solutionHeader);
+    await dataversePost(orgUrl, token, 'api/data/v9.2/customapirequestparameters', {
+        uniquename: 'input',
+        name: 'Input',
+        description: 'JSON-serialized input object. Deserialize in the plugin handler.',
+        type: 10, // String
+        isoptional: false,
+        'CustomAPIId@odata.bind': `/customapis(${apiId})`,
+    }, solutionHeader);
+    await dataversePost(orgUrl, token, 'api/data/v9.2/customapiresponseproperties', {
+        uniquename: 'output',
+        name: 'Output',
+        description: 'JSON-serialized output object. Serialized in the plugin handler.',
+        type: 10, // String
+        'CustomAPIId@odata.bind': `/customapis(${apiId})`,
+    }, solutionHeader);
+    return apiId;
 }
 // ---------------------------------------------------------------------------
 // Deploy a single file
@@ -448,7 +579,7 @@ async function deployPackageToCrm(csprojPath, log) {
     try {
         const pkgEntry = (0, pluginConfig_1.getPackageEntry)(config);
         if (pkgEntry) {
-            const plugins = await fetchPluginAssemblies(orgUrl, accessToken, packageId);
+            const plugins = await fetchPluginTypes(orgUrl, accessToken, packageId);
             pkgEntry.plugins = plugins;
             (0, pluginConfig_1.savePluginConfig)(configPath, config);
             log(`  ${plugins.length} plugin(s) updated in ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}`);
@@ -533,7 +664,7 @@ async function createNewPluginPackage(csprojPath, configPath, config, log) {
         log(`Warning: could not register package in solution: ${err instanceof Error ? err.message : String(err)}`);
     }
     log('Fetching registered plugin assemblies...');
-    const plugins = await fetchPluginAssemblies(orgUrl, accessToken, packageId);
+    const plugins = await fetchPluginTypes(orgUrl, accessToken, packageId);
     const createdEntry = (0, pluginConfig_1.getPackageEntry)(config);
     if (plugins.length > 0 && createdEntry) {
         createdEntry.plugins = plugins;
@@ -566,16 +697,19 @@ function findNupkg(cwd) {
     }
     return null;
 }
-async function fetchPluginAssemblies(orgUrl, token, packageId) {
+// One PluginEntry per PLUGIN TYPE (name = typename, pluginId = plugintypeid), matching the
+// config shape written by the MxMcpDataverse MCP. The assembly-level flattening used before
+// wrote pluginassemblyid into the config and collapsed multi-type assemblies into one entry.
+async function fetchPluginTypes(orgUrl, token, packageId) {
     const stepsExpand = 'plugintype_sdkmessageprocessingstep($select=sdkmessageprocessingstepid,name,mode,stage,rank,filteringattributes)';
-    const typesExpand = `pluginassembly_plugintype($select=plugintypeid;$expand=${stepsExpand})`;
+    const typesExpand = `pluginassembly_plugintype($select=plugintypeid,typename;$expand=${stepsExpand})`;
     const filter = encodeURIComponent(`_packageid_value eq '${packageId}'`);
     const query = `$filter=${filter}&$select=name,pluginassemblyid&$expand=${encodeURIComponent(typesExpand)}`;
     const assembliesData = await dataverseGet(orgUrl, token, `api/data/v9.2/pluginassemblies?${query}`);
-    const entries = (assembliesData.value ?? []).map((a) => {
-        const rawSteps = (a.pluginassembly_plugintype ?? [])
-            .flatMap(t => t.plugintype_sdkmessageprocessingstep ?? []);
-        const steps = rawSteps.map(s => ({
+    const entries = (assembliesData.value ?? []).flatMap((a) => (a.pluginassembly_plugintype ?? []).map((t) => ({
+        name: t.typename,
+        pluginId: t.plugintypeid,
+        steps: (t.plugintype_sdkmessageprocessingstep ?? []).map((s) => ({
             stepId: s.sdkmessageprocessingstepid,
             name: s.name,
             mode: s.mode,
@@ -584,9 +718,8 @@ async function fetchPluginAssemblies(orgUrl, token, packageId) {
             filteringAttributes: csv(s.filteringattributes),
             preImages: [],
             postImages: [],
-        }));
-        return { name: a.name, pluginId: a.pluginassemblyid, steps };
-    });
+        })),
+    })));
     const allStepIds = entries.flatMap(e => (e.steps ?? []).map(s => s.stepId));
     if (allStepIds.length > 0) {
         const imageFilter = allStepIds
