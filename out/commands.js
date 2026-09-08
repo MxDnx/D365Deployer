@@ -196,7 +196,10 @@ async function deployPackageWithAttributes(csprojPath, log) {
             }
         }
     }
-    // Refresh config with final state
+    // Refresh config with final state, then verify that Dataverse holds what the source declares.
+    // Every write above is best-effort (idempotent redeploys), so this is the one place that turns
+    // a silently skipped filter or image into a visible failure.
+    let mismatches = [];
     try {
         const refreshed = await fetchPluginTypes(orgUrl, token, packageId);
         const refreshEntry = (0, pluginConfig_1.getPackageEntry)(config);
@@ -205,11 +208,47 @@ async function deployPackageWithAttributes(csprojPath, log) {
             (0, pluginConfig_1.savePluginConfig)(configPath, config);
             log(`\n${pluginConfig_1.PLUGIN_CONFIG_FILENAME} updated.`);
         }
+        mismatches = verifyRegistrations(refreshed, analysisResults);
     }
     catch (err) {
         log(`\nWarning: could not refresh ${pluginConfig_1.PLUGIN_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`);
     }
-    log('\nDeployment with attributes complete.');
+    if (mismatches.length === 0) {
+        log('\nVerification: every step, filter and image matches the source.');
+        log('\nDeployment with attributes complete.');
+    }
+    else {
+        log('\nVERIFICATION FAILED:');
+        for (const m of mismatches)
+            log(`  - ${m}`);
+        throw new Error(`Deployment finished with ${mismatches.length} registration mismatch(es), see the output.`);
+    }
+}
+const sameSet = (a, b) => [...a].map(x => x.trim()).sort().join(',') === [...b].map(x => x.trim()).sort().join(',');
+/** One line per difference between the [PluginStep] declarations and the registered steps; empty when all match. */
+function verifyRegistrations(plugins, analysisResults) {
+    const steps = plugins.flatMap(p => p.steps ?? []);
+    const problems = [];
+    for (const r of analysisResults) {
+        if (!r.pluginStep)
+            continue;
+        const name = `${r.className}: ${r.pluginStep.message} of ${r.pluginStep.entityName}`;
+        const step = steps.find(s => s.name === name);
+        if (!step) {
+            problems.push(`[${r.className}] step "${name}" is not registered`);
+            continue;
+        }
+        if (!sameSet(step.filteringAttributes ?? [], r.targetFields))
+            problems.push(`[${r.className}] filteringAttributes = "${(step.filteringAttributes ?? []).join(',')}", source declares "${r.targetFields.join(',') || '(all)'}"`);
+        const image = step.preImages?.[0];
+        if (r.preImageFields.length && !image)
+            problems.push(`[${r.className}] PreImage missing, source declares "${r.preImageFields.join(',')}"`);
+        else if (r.preImageFields.length && image && !sameSet(image.attributes ?? [], r.preImageFields))
+            problems.push(`[${r.className}] PreImage attributes = "${(image.attributes ?? []).join(',')}", source declares "${r.preImageFields.join(',')}"`);
+        else if (!r.preImageFields.length && image)
+            problems.push(`[${r.className}] PreImage "${(image.attributes ?? []).join(',')}" registered but the source declares none`);
+    }
+    return problems;
 }
 // ─── Step / image REST helpers ───────────────────────────────────────────────
 function stageToInt(stage) {
